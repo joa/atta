@@ -1,0 +1,1058 @@
+<!DOCTYPE html><html><head><script>
+"use strict";
+
+// ATTA - that's a good shader!
+// ============================
+// Drop-in replacement for WebGLRenderingContext that is capable of compiling
+// GLSL code to a more optimized representation before sending it to the
+// graphics card.
+//
+// Mission
+// -------
+// Provide better performance and error reporting for GLSL shaders with minimal
+// configuration by the user
+//
+// GLSL spec
+// ---------
+// https://www.khronos.org/registry/gles/specs/2.0/GLSL_ES_Specification_1.0.17.pdf
+//
+// Implementation
+// --------------
+// Notes about the implementation of different parts as I go. The main mantra is
+// to do as little unnecessary work as possible. That means the scanner should
+// examine the source code only once, and the parser should directly parse into
+// SSA form without previous representations -- maybe even inline along the way.
+//
+// Scanner
+// ^^^^^^^
+// I don't want to traverse the source code of the shader more than once.
+// Therefore the scanner itself is expanding preprocessor directives while
+// scanning.
+//
+// Preprocessor
+// """"""""""""
+// Note that there are some preprocessor directives that we have to forward to
+// the graphics card, like '#version'. The preprocessor directives are stored as
+// a stream of tokens and expanding a directive leads to a clone of those tokens.
+// The scanner will return tokens from its internal preprocessor-directive buffer
+// until it is exhausted and continue with normal scanning.
+//
+// Macro expansion for parameterized macros is currently not implemented. One has
+// to substitute parameters in the buffer for their actual values which shouldn't
+// be hard to achieve.
+//
+// Error Recovery
+// """"""""""""""
+// I shoot for end-of-line at the moment whenever error recovery is possible in
+// the scanner.
+//
+// Parser
+// ^^^^^^
+// In order to achieve little overhead the parser will immediately parse the
+// tokens into a graph structure.
+//
+function namespace() { var o = {}; delete o.x; return o; }
+var ATTA = namespace();
+if(typeof module == 'object') {
+  module.exports = ATTA;
+}
+
+// ATTA.Array
+ATTA.Array = namespace();
+ATTA.Array.clone = function(source) {
+  return source.splice();
+};
+
+// ATTA.Map
+// ========
+// Key-value mapping with usual convenience methods.
+// Use ATTA.Map.empty() to create an empty instance
+ATTA.Map = namespace();
+ATTA.Map.empty = function() {
+  var o = {
+    put: function(key, value) { this[key] = value; },
+    get: function(key) { return this[key]; },
+    remove: function(key) { delete this.key; },
+    contains: function(key) { return this[key] !== undefined; }
+  };
+  delete o.x;
+  return o;
+};
+
+// ATTA.ImmutableSet
+// =================
+// Immutable set of values; does not have to be discrete.
+// Use ATTA.ImmutableSet.ofValues(x0, x1, ..., xN) to create a new instance.
+//
+// ATTA.ImmutableSet.ofChars("abc") is a convenience method for
+// ATTA.ImmutableSet.ofValues('a', 'b', 'c')
+ATTA.ImmutableSet = namespace();
+
+ATTA.ImmutableSet.ofValues = function() {
+  var o = ATTA.Map.empty();
+  var i = arguments.length;
+  while(--i > -1) o[arguments[i]] = true;
+  return { contains: function(x) { return o[x] === true; } };
+};
+
+ATTA.ImmutableSet.ofChars = function(chars) { return ATTA.ImmutableSet.ofValues.apply(null, chars.split('')); };
+ATTA.ImmutableSet.ofFunction = function(f) { return { contains: function(x) { var r = f(x); r !== false && r !== undefined; } }; };
+ATTA.ImmutableSet.ofUnion = function(x, y) { return { contains: function(z) { return x.contains(z) || y.contains(z); } }; };
+
+// ATTA.Shader
+ATTA.Shader = namespace();
+
+var _ = 0,
+  TOKEN_ERROR = ++_,
+  TOKEN_EOF = ++_,
+  TOKEN_IDENTIFIER = ++_,
+  TOKEN_PP_EMPTY = ++_,
+  TOKEN_PP_DEFINE = ++_,
+  TOKEN_PP_UNDEF = ++_,
+  TOKEN_PP_IF = ++_,
+  TOKEN_PP_IFDEF = ++_,
+  TOKEN_PP_IFNDEF = ++_,
+  TOKEN_PP_ELSE = ++_,
+  TOKEN_PP_ELIF = ++_,
+  TOKEN_PP_ENDIF = ++_,
+  TOKEN_PP_ERROR = ++_,
+  TOKEN_PP_PRAGMA = ++_,
+  TOKEN_PP_EXTENSION = ++_,
+  TOKEN_PP_VERSION = ++_,
+  TOKEN_PP_LINE = ++_,
+  TOKEN_PP_DEFINED = ++_,
+  TOKEN_COMMENT_SINGLE = ++_,
+  TOKEN_COMMENT_MULTI = ++_,
+  TOKEN_DOT = ++_,
+  TOKEN_PLUS = ++_,
+  TOKEN_MINUS = ++_,
+  TOKEN_DIVIDE = ++_,
+  TOKEN_MULTIPLY = ++_,
+  TOKEN_MODULO = ++_,
+  TOKEN_LT = ++_,
+  TOKEN_GT = ++_,
+  TOKEN_LBRAC = ++_,
+  TOKEN_RBRAC = ++_,
+  TOKEN_LPAREN = ++_,
+  TOKEN_RPAREN = ++_,
+  TOKEN_LCURL = ++_,
+  TOKEN_RCURL = ++_,
+  TOKEN_BIT_XOR = ++_,
+  TOKEN_BIT_OR = ++_,
+  TOKEN_BIT_AND = ++_,
+  TOKEN_BIT_NOT = ++_,
+  TOKEN_LOG_EQUAL = ++_,
+  TOKEN_LOG_OR = ++_,
+  TOKEN_LOG_AND = ++_,
+  TOKEN_LOG_NOT = ++_,
+  TOKEN_ASSIGN = ++_,
+  TOKEN_COLON = ++_,
+  TOKEN_SEMICOLON = ++_,
+  TOKEN_COMMA = ++_,
+  TOKEN_QUESTION = ++_,
+  TOKEN_LIT_INTEGER = ++_,
+  TOKEN_LIT_FLOAT = ++_,
+  TOKEN_KEYWORD_ATTRIBUTE = ++_,
+  TOKEN_KEYWORD_CONST = ++_,
+  TOKEN_KEYWORD_UNIFORM = ++_,
+  TOKEN_KEYWORD_VARYING = ++_,
+  TOKEN_KEYWORD_BREAK = ++_,
+  TOKEN_KEYWORD_CONTINUE = ++_,
+  TOKEN_KEYWORD_DO = ++_,
+  TOKEN_KEYWORD_FOR = ++_,
+  TOKEN_KEYWORD_WHILE = ++_,
+  TOKEN_KEYWORD_IF = ++_,
+  TOKEN_KEYWORD_ELSE = ++_,
+  TOKEN_KEYWORD_IN = ++_,
+  TOKEN_KEYWORD_OUT = ++_,
+  TOKEN_KEYWORD_INOUT = ++_,
+  TOKEN_KEYWORD_FLOAT = ++_,
+  TOKEN_KEYWORD_INT = ++_,
+  TOKEN_KEYWORD_VOID = ++_,
+  TOKEN_KEYWORD_BOOL = ++_,
+  TOKEN_LIT_TRUE = ++_,
+  TOKEN_LIT_FALSE = ++_,
+  TOKEN_KEYWORD_LOWP = ++_,
+  TOKEN_KEYWORD_MEDIUMP = ++_,
+  TOKEN_KEYWORD_HIGHP = ++_,
+  TOKEN_KEYWORD_PRECISION = ++_,
+  TOKEN_KEYWORD_INVARIANT = ++_,
+  TOKEN_KEYWORD_DISCARD = ++_,
+  TOKEN_KEYWORD_RETURN = ++_,
+  TOKEN_KEYWORD_MAT2 = ++_,
+  TOKEN_KEYWORD_MAT3 = ++_,
+  TOKEN_KEYWORD_MAT4 = ++_,
+  TOKEN_KEYWORD_VEC2 = ++_,
+  TOKEN_KEYWORD_VEC3 = ++_,
+  TOKEN_KEYWORD_VEC4 = ++_,
+  TOKEN_KEYWORD_IVEC2 = ++_,
+  TOKEN_KEYWORD_IVEC3 = ++_,
+  TOKEN_KEYWORD_IVEC4 = ++_,
+  TOKEN_KEYWORD_BVEC2 = ++_,
+  TOKEN_KEYWORD_BVEC3 = ++_,
+  TOKEN_KEYWORD_BVEC4 = ++_,
+  TOKEN_KEYWORD_SAMPLER2D = ++_,
+  TOKEN_KEYWORD_SAMPLERCUBE = ++_,
+  TOKEN_KEYWORD_STRUCT = ++_,
+  TOKEN_BAILOUT = ++_;
+
+// ATTA.Shader.Preprocessor
+ATTA.Shader.Preprocessor = function() {
+  var makeInt = function(value) {
+    var valueAsText = ''+value;
+    var result = new ATTA.Shader.Scanner.Token(TOKEN_LIT_INTEGER, null, valueAsText.length, valueAsText);
+    result.intValue = value;
+    return result;
+  };
+
+  var predef = {
+    'GL_ES': function() { return [makeInt(1)]; },
+    '__VERSION__': function() { return [makeInt(100)]; },
+  }
+
+  var symbols = ATTA.Map.empty();
+
+  return function() {
+    for(var name in predef) {
+      symbols[name] = {
+        parameters: [],
+        tokens: predef[name]()
+      }
+    }
+
+    this.define = function(name, parameters, value) {
+      var tokens = value || makeInt(1);
+      symbols[name] = {
+        parameters: parameters || [],
+        tokens: Array.isArray(tokens) ? token : [tokens]
+      }
+    };
+
+    this.get = function(name) {
+      return symbols[name];
+    };
+
+    this.undef = function(name) {
+      delete symbols[name];
+    };
+
+    this.isDefined = function(name) {
+      return symbols[name] !== undefined;
+    }
+  }
+}();
+
+ATTA.Shader.Context = function() {
+  this.preprocessor = new ATTA.Shader.Preprocessor();
+}
+
+// ATTA.Shader.Scanner
+ATTA.Shader.Scanner = function() {
+  var PREPROCESSOR_DIRECTIVES = {
+    ''           : TOKEN_PP_EMPTY,
+    'define'     : TOKEN_PP_DEFINE,
+    'undef'      : TOKEN_PP_UNDEF,
+    'if'         : TOKEN_PP_IF,
+    'ifdef'      : TOKEN_PP_IFDEF,
+    'ifndef'     : TOKEN_PP_IFNDEF,
+    'else'       : TOKEN_PP_ELSE,
+    'elif'       : TOKEN_PP_ELIF,
+    'endif'      : TOKEN_PP_ENDIF,
+    'error'      : TOKEN_PP_ERROR,
+    'pragma'     : TOKEN_PP_PRAGMA,
+    'extension'  : TOKEN_PP_EXTENSION,
+    'version'    : TOKEN_PP_VERSION,
+    'line'       : TOKEN_PP_LINE,
+    'defined'    : TOKEN_PP_DEFINED
+  };
+
+  var SINGLE_CHAR_TOKENS = {
+    '.'          : TOKEN_DOT,
+    '+'          : TOKEN_PLUS,
+    '-'          : TOKEN_MINUS,
+    '/'          : TOKEN_DIVIDE,
+    '*'          : TOKEN_MULTIPLY,
+    '%'          : TOKEN_MODULO,
+    '<'          : TOKEN_LT,
+    '>'          : TOKEN_GT,
+    '['          : TOKEN_LBRAC,
+    ']'          : TOKEN_RBRAC,
+    '('          : TOKEN_LPAREN,
+    ')'          : TOKEN_RPAREN,
+    '{'          : TOKEN_LCURL,
+    '}'          : TOKEN_RCURL,
+    '^'          : TOKEN_BIT_XOR,
+    '|'          : TOKEN_BIT_OR,
+    '&'          : TOKEN_BIT_AND,
+    '~'          : TOKEN_BIT_NOT,
+    '!'          : TOKEN_LOG_NOT,
+    '='          : TOKEN_ASSIGN,
+    ':'          : TOKEN_COLON,
+    ';'          : TOKEN_SEMICOLON,
+    ','          : TOKEN_COMMA,
+    '?'          : TOKEN_QUESTION
+  };
+
+  var KEYWORDS = {
+    'attribute'  : TOKEN_KEYWORD_ATTRIBUTE,
+    'const'      : TOKEN_KEYWORD_CONST,
+    'uniform'    : TOKEN_KEYWORD_UNIFORM,
+    'varying'    : TOKEN_KEYWORD_VARYING,
+    'break'      : TOKEN_KEYWORD_BREAK,
+    'continue'   : TOKEN_KEYWORD_CONTINUE,
+    'do'         : TOKEN_KEYWORD_DO,
+    'for'        : TOKEN_KEYWORD_FOR,
+    'while'      : TOKEN_KEYWORD_WHILE,
+    'if'         : TOKEN_KEYWORD_IF,
+    'else'       : TOKEN_KEYWORD_ELSE,
+    'in'         : TOKEN_KEYWORD_IN,
+    'out'        : TOKEN_KEYWORD_OUT,
+    'inout'      : TOKEN_KEYWORD_INOUT,
+    'float'      : TOKEN_KEYWORD_FLOAT,
+    'int'        : TOKEN_KEYWORD_INT,
+    'void'       : TOKEN_KEYWORD_VOID,
+    'bool'       : TOKEN_KEYWORD_BOOL,
+    'true'       : TOKEN_LIT_TRUE,
+    'false'      : TOKEN_LIT_FALSE,
+    'lowp'       : TOKEN_KEYWORD_LOWP,
+    'mediump'    : TOKEN_KEYWORD_MEDIUMP,
+    'highp'      : TOKEN_KEYWORD_HIGHP,
+    'precision'  : TOKEN_KEYWORD_PRECISION,
+    'invariant'  : TOKEN_KEYWORD_INVARIANT,
+    'discard'    : TOKEN_KEYWORD_DISCARD,
+    'return'     : TOKEN_KEYWORD_RETURN,
+    'mat2'       : TOKEN_KEYWORD_MAT2,
+    'mat3'       : TOKEN_KEYWORD_MAT3,
+    'mat4'       : TOKEN_KEYWORD_MAT4,
+    'vec2'       : TOKEN_KEYWORD_VEC2,
+    'vec3'       : TOKEN_KEYWORD_VEC3,
+    'vec4'       : TOKEN_KEYWORD_VEC4,
+    'ivec2'      : TOKEN_KEYWORD_IVEC2,
+    'ivec3'      : TOKEN_KEYWORD_IVEC3,
+    'ivec4'      : TOKEN_KEYWORD_IVEC4,
+    'bvec2'      : TOKEN_KEYWORD_BVEC2,
+    'bvec3'      : TOKEN_KEYWORD_BVEC3,
+    'bvec4'      : TOKEN_KEYWORD_BVEC4,
+    'sampler2D'  : TOKEN_KEYWORD_SAMPLER2D,
+    'samplerCube': TOKEN_KEYWORD_SAMPLERCUBE,
+    'struct'     : TOKEN_KEYWORD_STRUCT
+  };
+
+  var FUTURE_KEYWORDS = ATTA.ImmutableSet.ofValues(
+    "asm", "class", "union", "enum", "typedef", "template", "this", "packed",
+    "goto", "switch", "default", "inline", "noinline", "volatile", "public",
+    "static", "extern", "external", "interface", "flat", "long", "short",
+    "double", "half", "fixed", "unsigned", "superp", "input", "output", "hvec2",
+    "hvec3", "hvec4", "dvec2", "dvec3", "dvec4", "fvec2", "fvec3", "fvec4",
+    "sampler1D", "sampler3D", "sampler1DShadow", "sampler2DShadow",
+    "sampler2DRect", "sampler3DRect", "sampler2DRectShadow",
+    "sizeof", "cast", "namespace", "using");
+
+  var MIN_KEYWORD_LENGTH = 2;
+  var MAX_KEYWORD_LENGTH = 11;
+
+  return function(code, context) {
+    if(code instanceof HTMLScriptElement) {
+    	code = code.text;
+    }
+
+    var index = 0;
+    var eof = code.length;
+    var numRow = 0;
+    var numCol = 0;
+    var numFile = 0;
+    var isFirstNonComment = true;
+    var buffer;
+
+    var currentChar = function() {
+    	return index < eof ? code[index] : '';
+    };
+
+    var peekNextChar = function() {
+    	var nextIndex = index + 1;
+    	return nextIndex < eof ? code[nextIndex] : '';
+    };
+
+    var onNewLine = function() {
+    	++numRow;
+    	numCol = 0;
+    };
+
+    var advance = function() {
+      ++index;
+      ++numCol;
+    };
+
+    var rewind = function() {
+      ++index;
+      --numCol;
+      if(numCol < 0) {
+        throw new Error("Internal error");
+      }
+    };
+
+    var advanceWithNewBuffer = function(c) {
+      buffer = c;
+      advance();
+    };
+
+    var advanceAndAppendBuffer = function(c) {
+      buffer += c;
+      advance();
+    };
+
+    var ignoreCurrentLine = function() {
+      while(index < eof) {
+        var c = currentChar();
+
+        advance();
+
+        if(c == '\r') {
+          if(currentChar() == '\n') {
+            advance();
+          }
+          onNewLine();
+          return;
+        } else if(c == '\n') {
+          onNewLine();
+          return;
+        }
+      }
+    };
+
+    var identContainsTwoConsecutiveUnderscores = false;
+    var identStartsWithGL = false;
+
+    var identifier = function(c) {
+    	var length = 1;
+    	var wasUnderscore = c == '_';
+    	var startsWithGLState = c == 'g' ? 1 : 0;
+
+    	identContainsTwoConsecutiveUnderscores = false;
+    	identStartsWithGL = false;
+
+    	advanceWithNewBuffer(c);
+      c = currentChar();
+
+    	while(ATTA.Shader.Scanner.isIdentifierPart(c)) {
+    	  if(startsWithGLState == 1) {
+    	    startsWithGLState = c == 'l' ? 2 : 0;
+    	  } else if(startsWithGLState == 2) {
+    	    identStartsWithGL = c == '_';
+    	    startsWithGLState = 0;
+    	  }
+
+    	  var isUnderscore = !identContainsTwoConsecutiveUnderscores && c == '_'
+
+    	  if(isUnderscore && wasUnderscore) {
+    	    identContainsTwoConsecutiveUnderscores = true;
+    	  }
+
+    	  advanceAndAppendBuffer(c);
+        c = currentChar();
+    	  wasUnderscore = isUnderscore;
+    	  ++length;
+    	}
+
+    	return length;
+    };
+
+    var number = function(c) {
+      var pos = currentPosition();
+      var length = 1;
+      var token;
+
+      function bufferCharAndGetNext(c) {
+        advanceAndAppendBuffer(c);
+        ++length;
+        return currentChar();
+      }
+
+      function parseDigitSequence() {
+        c = currentChar();
+        while(ATTA.Shader.Scanner.isNumber(c)) {
+          c = bufferCharAndGetNext(c);
+        }
+      }
+
+      function parseExponentPart() {
+        c = currentChar();
+
+        if(c == 'e' || c == 'E') {
+          c = bufferCharAndGetNext(c);
+
+          if(c == '+' || c == '-') {
+            c = bufferCharAndGetNext(c)
+          }
+
+          if(!ATTA.Shader.Scanner.isNumber(c)) {
+            return false;
+          }
+
+          parseDigitSequence();
+        }
+
+        return true;
+      }
+
+      function exponentRequired() {
+        return newError("Exponent required", pos, length);
+      }
+
+      advanceWithNewBuffer(c);
+
+      if(c == '0') {
+        c = currentChar();
+
+        if(c == 'x' || c == 'X') {
+          // 0x or 0X
+          c = bufferCharAndGetNext(c);
+          while(ATTA.Shader.Scanner.isHexDigit(c)) {
+            c = bufferCharAndGetNext(c);
+          }
+
+          if(length == 2) {
+            return newError("Hex digit required", pos, length);
+          } else {
+            token = newToken(TOKEN_LIT_INTEGER, pos, length, buffer);
+            token.intValue = parseInt(buffer.substring(2), 16);
+            return token;
+          }
+        } else if(ATTA.Shader.Scanner.isNumber(c)) {
+          // 0[0-9]
+          c = bufferCharAndGetNext(c);
+          parseDigitSequence();
+          token = newToken(TOKEN_LIT_INTEGER, pos, length, buffer);
+          token.intValue = parseInt(buffer, 8);
+          return token;
+        } else if(c == '.') {
+          // 0.
+          c = bufferCharAndGetNext(c)
+
+          if(!ATTA.Shader.Scanner.isNumber(c)) {
+            token = newToken(TOKEN_LIT_FLOAT, pos, 2, "0.");
+            token.doubleValue = 0.0;
+            return token;
+          }
+
+          parseDigitSequence();
+          parseExponentPart();
+          token = newToken(TOKEN_LIT_FLOAT, pos, length, buffer);
+          token.doubleValue = parseFloat(buffer);
+        } else if(c == 'e' || c == 'E') {
+          // 0e or 0E
+          if(!parseExponentPart()) {
+            return exponentRequired();
+          }
+          token = newToken(TOKEN_LIT_FLOAT, pos, length, buffer);
+          token.doubleValue = parseFloat(buffer);
+          return token;
+        } else {
+          // 0
+          token = newToken(TOKEN_LIT_INTEGER, pos, 1, '0');
+          token.intValue = 0;
+          return token;
+        }
+      } else if(c == '.') {
+        // .[0-9]
+        // we know that a digit follows the '.' otherwise we wouldn't be here
+        parseDigitSequence();
+
+        if(!parseExponentPart()) {
+          return exponentRequired();
+        }
+
+        token = newToken(TOKEN_LIT_FLOAT, pos, length, buffer);
+        token.doubleValue = parseFloat(buffer);
+        return token;
+      } else {
+        parseDigitSequence();
+        c = currentChar();
+
+        if(c == '.') {
+          c = bufferCharAndGetNext(c);
+
+          parseDigitSequence();
+
+          if(!parseExponentPart()) {
+            return exponentRequired();
+          }
+
+          token = newToken(TOKEN_LIT_FLOAT, pos, length, buffer);
+          token.doubleValue = parseFloat(buffer);
+          return token;
+        } else if(c == 'e' || c == 'E') {
+          if(!parseExponentPart()) {
+            return exponentRequired();
+          }
+
+          token = newToken(TOKEN_LIT_FLOAT, pos, length, buffer);
+          token.doubleValue = parseFloat(buffer);
+          return token;
+        }
+
+        token = newToken(TOKEN_LIT_INTEGER, pos, length, buffer);
+        token.intValue = parseInt(buffer, 10);
+        return token;
+      }
+    };
+
+    var singleLineComment = function(pos) {
+      var c = currentChar();
+      var length = 2; // for the '//'
+      buffer = '';
+
+      while(!ATTA.Shader.Scanner.isNewLine(c)) {
+        advanceAndAppendBuffer(c);
+        ++length;
+        c = currentChar();
+      }
+
+      if(c == '\r' && peekNextChar() == '\n') {
+        advance();
+      }
+
+      return newToken(TOKEN_COMMENT_SINGLE, pos, length, buffer);
+    };
+
+    var multiLineComment = function(pos) {
+      var c = currentChar();
+      var length = 2; // for the '/*'
+      buffer = '';
+
+      while(c != '') {
+        if(c == '*' && peekNextChar() == '/') {
+          advance();
+          advance();
+          length += 2;
+          return newToken(TOKEN_COMMENT_MULTI, pos, length, buffer);
+        } else if(c == '\r') {
+          advanceAndAppendBuffer(c);
+      	  if(currentChar() == '\n') {
+      	    ++length;
+            advanceAndAppendBuffer('\n');
+      	  }
+      	  onNewLine();
+      	} else if(c == '\n') {
+          advanceAndAppendBuffer(c);
+          onNewLine();
+      	} else {
+          advanceAndAppendBuffer(c);
+        }
+
+        ++length;
+        c = currentChar();
+      }
+
+      return newError("Unexpected <end-of-file> (comment not closed)", currentPosition(), 0);
+    };
+
+    var currentPosition = function() {
+    	return {
+    	  line: numRow,
+    	  column: numCol,
+    	  file: numFile,
+    	  index: index,
+    	  toString: function() {
+    	    return '['+this.line+':'+this.column+']'
+    	  }
+  	  };
+    };
+
+    var currentPositionAndAdvance = function() {
+    	var pos = currentPosition();
+    	advance();
+    	return pos;
+    };
+
+    var newToken = function(id, position, length, value) {
+      if(isFirstNonComment && id != TOKEN_COMMENT_SINGLE && id != TOKEN_COMMENT_SINGLE) {
+        isFirstNonComment = false;
+      }
+
+      return new ATTA.Shader.Scanner.Token(id,
+        position || currentPosition(),
+        length   || 0,
+        value    || '');
+    };
+
+    var newInt = function(pos, length, value) {
+      var t = newToken(TOKEN_LIT_INTEGER, pos, length, ''+value);
+      t.intValue = value;
+      return t;
+    };
+
+    var newError = function(message, position, length) {
+      return newToken(TOKEN_ERROR, position, length, message);
+    };
+
+    var newBailout = function(message, position, length) {
+      return newToken(TOKEN_BAILOUT, position, length, message);
+    };
+
+    var self = this;
+
+    var handlePreprocessorDirective = function(token, pos, length) {
+      var c;
+
+      function discardWhitespace(breakOnNewLine) {
+        while(index < eof) {
+          c = currentChar();
+
+          if(!ATTA.Shader.Scanner.isWhitespace(c) || breakOnNewLine && ATTA.Shader.Scanner.isNewLine(c)) {
+            break;
+          } else {
+            advance();
+          }
+        }
+      }
+
+      function appendLineToBuffer() {
+        while(index < eof) {
+          c = currentChar();
+
+          if(ATTA.Shader.Scanner.isNewLine(c)) {
+            break;
+          } else {
+            advanceAndAppendBuffer(c);
+            ++length;
+          }
+        }
+      }
+
+    	switch(token) {
+    	  case TOKEN_PP_DEFINE:
+    	    var ident = self.nextToken();
+    	    //TODO: check it is an ident
+    	    discardWhitespace(/*breakOnNewLine=*/true);
+    	    c = currentChar();
+
+    	    if(c == '(') {
+            return newBailout("Unsupported #define directive", pos, length);
+    	    } else if(ATTA.Shader.Scanner.isNewLine(c)) {
+    	      context.preprocessor.define(ident.value, [], newInt(pos, length, 1));
+    	    } else {
+    	      context.preprocessor.define(ident.value, [], self.nextToken());
+    	    }
+    	    break;
+
+    	  case TOKEN_PP_UNDEF:
+    	      var ident = self.nextToken();
+    	      //TODO: check it is an ident
+    	      context.preprocessor.undef(ident.value);
+    	      break;
+
+        case TOKEN_PP_IF:
+        case TOKEN_PP_IFDEF:
+        case TOKEN_PP_IFNDEF:
+          var condition;
+
+          if(token == TOKEN_PP_IF) {
+            // Expand and check the value of the token
+            var value = self.nextToken(true);
+            switch(value.id) {
+              case TOKEN_LIT_INTEGER: condition = value.intValue != 0; break;
+              case TOKEN_LIT_FLOAT: condition = value.floatValue != 0.0; break;
+              default: condition = false;
+            }
+          } else {
+            // Do not expand and check if the identifier is defined
+            var ident = self.nextToken(false);
+            condition = ident.id == TOKEN_IDENTIFIER && context.preprocessor.isDefined(ident.value);
+          }
+
+          if(token == TOKEN_PP_IFNDEF) {
+            condition = !condition;
+          }
+
+          if(!condition) {
+            var pp = self.nextToken();
+            var ppId = pp.id;
+
+            while(ppId != TOKEN_EOF &&
+                  ppId != TOKEN_PP_ELSE &&
+                  ppId != TOKEN_PP_ELIF &&
+                  ppId != TOKEN_PP_ENDIF) {
+              pp = self.nextToken();
+              ppId = pp.id;
+            }
+
+            switch(ppId) {
+              case TOKEN_PP_ELSE:
+              case TOKEN_PP_ENDIF:
+                break;
+              case TOKEN_PP_ELIF:
+                // evaulate, if not, skip ahead!
+                break;
+              case TOKEN_EOF:
+                return newError((token == TOKEN_PP_IFDEF ? "#ifdef" : "#ifndef")+" without #endif", pos, length);
+            }
+          }
+          break;
+        case TOKEN_PP_ELSE:
+        case TOKEN_PP_ELIF:
+          return newError("Unmatched '#"+buffer+"' (there is no '#if', '#ifdef' or '#ifndef')", pos, length);
+        case TOKEN_PP_ENDIF:
+          //TODO(joa): error if unmatched, currently simply ignored
+          return newToken(token, pos, length, buffer);
+        case TOKEN_PP_ERROR:
+          appendLineToBuffer();
+          return newError('#'+buffer, pos, length);
+        case TOKEN_PP_PRAGMA:
+          appendLineToBuffer();
+          if(/optimize\(off\)$/.test(buffer)) {
+            return newBailout("Optimizations disabled via #pragma directive", pos, length);
+          }
+          return newToken(token, pos, length, '#'+buffer);
+        case TOKEN_PP_EXTENSION:
+          appendLineToBuffer();
+          return newToken(token, pos, length, '#'+buffer);
+        case TOKEN_PP_VERSION:
+          if(!isFirstNonComment) {
+            return newError("#version must be the first directive");
+          }
+
+          var version = self.nextToken();
+
+          if(version.id != TOKEN_LIT_INTEGER) {
+            return newError("Version number expected (like '#version 100' for instance)");
+          }
+
+          if(version.intValue < 100) {
+            return newError("Invalid version (minimum #version is 100)");
+          }
+
+          return newToken(token, pos, length, "#version "+version.intValue);
+        case TOKEN_PP_LINE:
+          var lineNo = self.nextToken();
+
+          if(lineNo.id != TOKEN_LIT_INTEGER) {
+            return newError("Line number expected (like '#line 1337' for instance)");
+          }
+
+          numRow = lineNo.intValue - 1;
+          numColumm = 0;
+
+          discardWhitespace(/*breakOnNewLine=*/true);
+          c = currentChar();
+
+          if(ATTA.Shader.Scanner.isNumber(c)) {
+            var fileNo = self.nextToken();
+
+            if(fileNo.id != TOKEN_LIT_INTEGER) {
+              return newError("File number expected (like '#line 0 1' for instance)");
+            }
+
+            numFile = fileNo.intValue;
+          } else if(!ATTA.Shader.Scanner.isNewline(c)) {
+            return newError("File number expected (like '#line 0 1' for instance)");
+          }
+
+          break;
+
+        case TOKEN_PP_DEFINED:
+          return newError("Unexpected token 'defined' (use this only in #if and stuff)", pos, length);
+    	}
+
+    	return null;
+    }
+
+    var currentMacro = [];
+
+    this.nextToken = function(expandMacros) {
+      expandMacros = expandMacros === undefined ? true : expandMacros;
+
+      if(currentMacro.length > 0) {
+        return currentMacro.shift();
+      }
+
+      while(index < eof) {
+        var c = currentChar();
+
+        if(ATTA.Shader.Scanner.isWhitespace(c)) {
+        	advance();
+
+        	if(c == '\r') {
+        	  if(currentChar() == '\n') {
+        	  	advance();
+        	  }
+        	  onNewLine();
+        	} else if(c == '\n') {
+            onNewLine();
+        	}
+        } else if(ATTA.Shader.Scanner.isIdentifierStart(c)) {
+        	var pos = currentPosition();
+        	var length = identifier(c);
+        	var token;
+
+        	if(!expandMacros) {
+        	  // Ff we do not perform macro expansion, we are not allowed to
+        	  // perform error checking for tokens like __FOO__ (those that
+        	  // would cause an error due to two consecutive underscores for
+        	  // instance)
+        	  token = newToken(TOKEN_IDENTIFIER, pos, length, buffer);
+        	  token.startsWithGL = identStartsWithGL;
+        	  return token;
+        	}
+
+          var macro = undefined;
+        	if(buffer == '__FILE__') {
+        	  return newInt(pos, length, numFile);
+        	} else if(buffer == '__LINE__') {
+        	  return newInt(pos, length, 1 + numRow);
+        	} else if((macro = context.preprocessor.get(buffer)) !== undefined) {
+        	  // We would have bailed out if the macro contains parameters in the
+        	  // first place so we don't need to check here again
+        	  if(macro.tokens.length == 1) {
+        	    return macro.tokens[0];
+        	  } else {
+        	    currentMacro = ATTA.Array.clone(macro.tokens);
+        	    return currentMacro.shift();
+        	  }
+        	} else if(identContainsTwoConsecutiveUnderscores) {
+        	  return newError(
+        	    "Use of potential future keyword '"+buffer+"' (two consecutive underscores)", pos, length);
+        	} else if(length >= MIN_KEYWORD_LENGTH && length <= MAX_KEYWORD_LENGTH) {
+        	  var keyword = KEYWORDS[buffer] | 0;
+
+        	  if(keyword != 0) {
+        	    token = newToken(keyword, pos, length, buffer);
+
+        	    if(token == TOKEN_LIT_TRUE) {
+        	      token.booleanValue = true;
+        	    } else if(token == TOKEN_LIT_FALSE) {
+        	      token.booleanValue = false;
+        	    }
+
+        	    return token;
+        	  }
+        	} else if(FUTURE_KEYWORDS.contains(buffer)) {
+        	  return newError(
+        	    "Use of potential future keyword '"+buffer+"'", pos, length);
+        	}
+
+        	token = newToken(TOKEN_IDENTIFIER, pos, length, buffer);
+        	token.startsWithGL = identStartsWithGL;
+        	return token;
+        } else if(c == '/') {
+          var pos = currentPositionAndAdvance();
+          c = currentChar();
+          if(c == '/') {
+            advance();
+            return singleLineComment(pos);
+          } else if(c == '*') {
+            advance();
+            return multiLineComment(pos);
+          } else {
+            return newToken(TOKEN_DIVIDE, pos, 1);
+          }
+        } else if(c == '.') {
+          if(ATTA.Shader.Scanner.isNumber(peekNextChar())) {
+            return number(c);
+          }
+          return newToken(TOKEN_DOT, currentPositionAndAdvance(), 1, c);
+        } else if(ATTA.Shader.Scanner.isNumber(c)) {
+        	return number(c);
+        } else if(ATTA.Shader.Scanner.isNumberSign(c)) {
+          var pos = currentPosition();
+        	advance();
+        	var length = 1 + identifier(currentChar());
+        	var token = PREPROCESSOR_DIRECTIVES[buffer] | 0;
+
+        	if(token === 0) {
+        	  ignoreCurrentLine();
+        	  return newError(
+        	    "Unexpected preprocessor directive '#"+buffer+"'", pos, length);
+        	}
+
+        	if(token !== TOKEN_PP_ENDIF) {
+        	  // endif may be dangling due to:
+        	  //
+        	  // #ifdef something undefined
+        	  //   dead code
+        	  // #else
+        	  //  some code
+        	  // #endif
+        	  //
+        	  // the #ifdef will skip ahead to some code, which continues
+        	  // with arbitrary parsing, yielding #endif here
+          	var result = handlePreprocessorDirective(token, pos, length);
+
+          	if(result != null) {
+          	  return result;
+          	}
+        	}
+        } else {
+          var token = SINGLE_CHAR_TOKENS[c] | 0;
+          if(token === 0) {
+            return newError("Unexpected character '"+c+"'", currentPositionAndAdvance(), 1);
+          } else {
+            return newToken(token, currentPositionAndAdvance(), 1, c);
+          }
+        }
+      }
+
+      return newToken(TOKEN_EOF);
+    };
+  }
+}();
+
+ATTA.Shader.Scanner.isWhitespace = ATTA.ImmutableSet.ofChars(' \t\v\f\r\n').contains
+ATTA.Shader.Scanner.isNewLine = function(c) { return c === '\r' || c === '\n' };
+ATTA.Shader.Scanner.isIdentifierStart = ATTA.ImmutableSet.ofChars('_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ').contains;
+ATTA.Shader.Scanner.isNumber = ATTA.ImmutableSet.ofChars('0123456789').contains;
+ATTA.Shader.Scanner.isHexDigit = ATTA.ImmutableSet.ofChars('0123456789abcdefABCDEF').contains;
+ATTA.Shader.Scanner.isNumberSign = function(c) { return c === '#' };
+ATTA.Shader.Scanner.isSymbol = ATTA.ImmutableSet.ofChars('.+-/*%<>[](){}^|&~=!:;,?').contains;
+ATTA.Shader.Scanner.isIdentifierPart = function(c) {
+  return ATTA.Shader.Scanner.isIdentifierStart(c)
+      || ATTA.Shader.Scanner.isNumber(c);
+};
+
+ATTA.Shader.Scanner.Token = function(id, position, length, value) {
+  this.id = id;
+  this.position = position;
+  this.length = length;
+  this.value = value || '';
+};
+
+ATTA.Shader.Scanner.Token.prototype = {
+  isEof: function() { return this.id == TOKEN_EOF; },
+  isError: function() { return this.id == TOKEN_ERROR; },
+  isBailout: function() { return this.id == TOKEN_BAILOUT; }
+}
+
+window.onload = function() {
+  console.time("TIME");
+  var code = document.getElementById('fragment');
+  var context = new ATTA.Shader.Context();
+  var scanner = new ATTA.Shader.Scanner(code, context);
+
+  while(true) {
+    var token = scanner.nextToken();
+    console.log(token);
+    if(token.isEof() || token.isError() || token.isBailout()) {
+      break;
+    }
+  }
+
+
+  console.timeEnd("TIME");
+};
+</script></head>
+<script id="fragment" type="x-shader/x-fragment">
+#version 100
+#define FOO 1.0
+#ifdef GL_ES
+precision mediump float;
+#endif
+uniform float time;
+uniform vec2 resolution;
+void main (void) {
+  vec2 p = (gl_FragCoord.xy / resolution.xy);
+#if FOO
+  gl_FragColor = vec4(p.x, p.y, (FOO + cos(time)) / 2., 1.0);
+#endif
+}
+</script>
+<body></body></html>
