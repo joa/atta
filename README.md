@@ -1,2 +1,1 @@
-# atta
-GLSL compiler in JavaScript
+WIP
